@@ -1,0 +1,42 @@
+{
+  "name": "koishi-plugin-ban-words",
+  "version": "1.2.1",
+  "description": "A Koishi content-filter plugin that reads a TXT dictionary file (one keyword per line), detects/blocks messages, and can recall offending messages.",
+  "author": "xiaoxiao <you@example.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/sdxcvbot/koishi-plugin-ban-words#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sdxcvbot/koishi-plugin-ban-words.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sdxcvbot/koishi-plugin-ban-words/issues"
+  },
+  "keywords": [
+    "koishi",
+    "plugin",
+    "moderation",
+    "filter",
+    "ban words",
+    "content filter"
+  ],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.18.9"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.1",
+    "typescript": "^5.5.4"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --dts --format cjs --target node16 --external koishi --out-dir lib",
+    "dev": "tsup src/index.ts --watch --dts --format cjs --target node16 --external koishi --out-dir lib",
+    "prepublishOnly": "npm run build"
+  }
+}
