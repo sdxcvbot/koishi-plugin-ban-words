@@ -1,4 +1,4 @@
-import { Context, Schema, Logger, Session, Element } from 'koishi'
+import { Context, Schema, Logger, Session, Element, h } from 'koishi'
 import fs from 'fs'
 import path from 'path'
 
@@ -13,7 +13,6 @@ export interface Config {
   replyHints?: string[]
   watch?: boolean
   batchSize?: number
-  // 新增
   onlyGroup?: boolean
   muteOnHit?: boolean
   muteSeconds?: number
@@ -28,20 +27,21 @@ export const Config: Schema<Config> = Schema.object({
   ignoreCase: Schema.boolean().default(true).description('忽略大小写匹配。'),
   recallOnHit: Schema.boolean().default(false).description('命中后尝试撤回原消息。'),
   blockOnHit: Schema.boolean().default(false).description('命中后阻断后续中间件。'),
-  replyHints: Schema.array(Schema.string()).default(['⚠️ 该消息包含违规内容，请注意用语。']).description('命中后回复提示。'),
+  replyHints: Schema.array(Schema.string())
+    .default(['{at} 你的发言包含违规词，已撤回并禁言 {minutes} 分钟。（ID: {id}，昵称：{name}）'])
+    .description('命中后回复提示，支持 {at} {name} {id} {minutes} 占位符。'),
   watch: Schema.boolean().default(true).description('监听词库文件变更并热重载。'),
   batchSize: Schema.number().default(400).description('合并正则的批大小。'),
-  // 新增
   onlyGroup: Schema.boolean().default(true).description('仅在群聊生效。'),
   muteOnHit: Schema.boolean().default(false).description('命中后禁言（仅 OneBot/QQ 有效）。'),
   muteSeconds: Schema.number().default(0).description('禁言秒数（0 表示不禁言）。'),
   logHits: Schema.boolean().default(true).description('命中时打印一条 info 日志。'),
 })
 
+/** 处理行：去 BOM/空白/行尾注释（未转义 #） */
 function normalizeLine(line: string) {
   line = line.replace(/^\uFEFF/, '').trim()
   if (!line) return ''
-  // 去掉未转义的行尾 # 注释
   let out = ''
   let escaped = false
   for (const ch of line) {
@@ -62,24 +62,20 @@ function buildMatchers(lines: string[], asRegex: boolean, ignoreCase: boolean, b
   const regs: RegExp[] = []
   for (let i = 0; i < lines.length; i += batchSize) {
     const chunk = lines.slice(i, i + batchSize)
-    const parts = chunk
-      .filter(Boolean)
-      .map(s => asRegex ? `(${s})` : `(${escapeReg(s)})`)
-    if (!parts.length) continue
-    regs.push(new RegExp(parts.join('|'), flags))
+    const parts = chunk.filter(Boolean).map(s => asRegex ? `(${s})` : `(${escapeReg(s)})`)
+    if (parts.length) regs.push(new RegExp(parts.join('|'), flags))
   }
   return regs
 }
 
+/** 更稳地从消息里抽取纯文本（忽略 @、表情、图片等） */
 function textFromElements(session: Session): string {
-  // 可靠抽取：只拼接纯文本节点，忽略 at / emoji / image 等
-  const els = session.elements as Element[] || []
+  const els = (session.elements as Element[]) || []
   const texts: string[] = []
   for (const el of els) {
     if (typeof el === 'string') { texts.push(el); continue }
-    if (el.type === 'text') texts.push(el.attrs?.content || el.children?.join('') || '')
+    if (el.type === 'text') texts.push(el.attrs?.content || (el.children?.join('') ?? ''))
   }
-  // 兜底：没有 elements 时，回退 content
   const t = texts.join('').trim()
   return t || (session.content || '').trim()
 }
@@ -100,15 +96,15 @@ async function safeRecall(session: Session) {
   }
 }
 
+/** 仅 OneBot/QQ 有效：需要机器人有管理员权限 */
 async function safeMuteIfOneBot(session: Session, seconds: number) {
   if (!seconds || seconds <= 0) return
   try {
-    // 仅 OneBot/QQ 有禁言 API
     if (session.platform?.startsWith('onebot')) {
       const bot: any = session.bot
-      const groupId = Number(session.guildId || session.channelId)
+      const groupId = Number(session.guildId) // QQ 群号
       const userId = Number(session.userId)
-      // v11 适配：internal.setGroupBan
+      // OneBot v11 常见接口
       if (bot?.internal?.setGroupBan && groupId && userId) {
         await bot.internal.setGroupBan(groupId, userId, seconds)
       }
@@ -123,6 +119,11 @@ export function apply(ctx: Context, config: Config) {
   let loadedCount = 0
   let dictAbs = ''
 
+  function readDictUtf8(file: string): string {
+    // 强制按 UTF-8 读取（GBK/ANSI 会导致中文丢失，从而匹配不到）
+    return fs.readFileSync(file, 'utf8')
+  }
+
   async function loadDict() {
     try {
       dictAbs = path.isAbsolute(config.dictPath) ? config.dictPath : path.resolve(process.cwd(), config.dictPath)
@@ -132,7 +133,7 @@ export function apply(ctx: Context, config: Config) {
         loadedCount = 0
         return
       }
-      const raw = fs.readFileSync(dictAbs, 'utf8')
+      const raw = readDictUtf8(dictAbs)
       const lines = raw.split(/\r?\n/).map(normalizeLine).filter(Boolean)
       loadedCount = lines.length
       regs = buildMatchers(lines, !!config.useRegex, !!config.ignoreCase, config.batchSize!)
@@ -147,19 +148,19 @@ export function apply(ctx: Context, config: Config) {
   // 初始化加载
   loadDict()
 
-  // 重载命令
+  // 命令：手动重载
   ctx.command('banwords.reload', '重载敏感词字典').action(async () => {
     await loadDict()
     return `已重载。当前 ${loadedCount} 条，来源：${dictAbs}`
   })
 
-  // 自测命令
+  // 命令：自测匹配
   ctx.command('banwords.test <text:text>', '测试文本是否命中敏感词').action(async ({}, text) => {
     if (!text) return '用法：banwords.test 需要测试的文本'
     return testHit(text, regs) ? '✅ 命中' : '❌ 未命中'
   })
 
-  // 监听文件变化（失败则轮询）
+  // 监听文件变化（失败则降级为轮询）
   if (config.watch) {
     try {
       const watcher = fs.watch(dictAbs, { persistent: false }, async (ev) => {
@@ -189,20 +190,28 @@ export function apply(ctx: Context, config: Config) {
     if (!text || regs.length === 0) return next()
 
     const hit = testHit(text, regs)
-
-    // 命中/未命中都打 info（若你嫌多，可把这里改成 debug）
     if (config.logHits) logger.info('check: text="%s" -> %s', text, hit ? 'HIT' : 'PASS')
-
     if (!hit) return next()
 
+    // 命中处理链
     if (config.recallOnHit) await safeRecall(session)
-
     if (config.muteOnHit && (config.muteSeconds || 0) > 0) {
-      await safeMuteIfOneBot(session, Math.max(0, config.muteSeconds! | 0))
+      await safeMuteIfOneBot(session, Math.max(0, (config.muteSeconds || 0) | 0))
     }
 
+    // 发送提示（支持占位符）
     if (config.replyHints?.length) {
-      const hint = config.replyHints[Math.floor(Math.random() * config.replyHints.length)]
+      const raw = config.replyHints[Math.floor(Math.random() * config.replyHints.length)]
+      const name = session.username || session.author?.nickname || session.author?.name || session.userId
+      const at = session.platform?.startsWith('onebot')
+        ? h('at', { id: session.userId }) // QQ/OneBot 真 @
+        : `@${name}`
+      const minutes = Math.max(0, Math.floor((config.muteSeconds || 0) / 60))
+      const hint = raw
+        .replace(/\{at\}/g, String(at))
+        .replace(/\{name\}/g, String(name))
+        .replace(/\{id\}/g, String(session.userId))
+        .replace(/\{minutes\}/g, String(minutes))
       await session.send(hint)
     }
 
