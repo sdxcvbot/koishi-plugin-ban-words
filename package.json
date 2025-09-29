@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-ban-words",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "A Koishi content-filter plugin that reads a TXT dictionary file (one keyword per line), detects/blocks messages, and can recall offending messages.",
   "author": "xiaoxiao <you@example.com>",
   "license": "MIT",
