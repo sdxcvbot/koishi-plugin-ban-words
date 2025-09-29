@@ -1,8 +1,8 @@
-import { Context, Schema, Session, Random } from 'koishi'
+import { Context, Schema, Logger, Session, Element } from 'koishi'
 import fs from 'fs'
 import path from 'path'
 
-export const name = 'ban-words'
+const logger = new Logger('ban-words')
 
 export interface Config {
   dictPath: string
@@ -12,143 +12,201 @@ export interface Config {
   blockOnHit?: boolean
   replyHints?: string[]
   watch?: boolean
+  batchSize?: number
+  // 新增
+  onlyGroup?: boolean
+  muteOnHit?: boolean
+  muteSeconds?: number
+  logHits?: boolean
 }
+
+export const name = 'ban-words'
 
 export const Config: Schema<Config> = Schema.object({
-  dictPath: Schema.string().description('词库 TXT 路径（可相对 Koishi 工作目录）。').required(),
-  useRegex: Schema.boolean().default(false).description('将每一行视为正则表达式。'),
+  dictPath: Schema.string().required().description('词库 TXT 路径（可相对 Koishi 工作目录）。'),
+  useRegex: Schema.boolean().default(false).description('将每一行视为正则式。'),
   ignoreCase: Schema.boolean().default(true).description('忽略大小写匹配。'),
-  recallOnHit: Schema.boolean().default(false).description('命中后尝试撤回该消息。'),
-  blockOnHit: Schema.boolean().default(true).description('命中后阻断后续中间件。'),
-  replyHints: Schema.array(String).role('table').description('命中后随机回复的提示语。').default([]),
+  recallOnHit: Schema.boolean().default(false).description('命中后尝试撤回原消息。'),
+  blockOnHit: Schema.boolean().default(false).description('命中后阻断后续中间件。'),
+  replyHints: Schema.array(Schema.string()).default(['⚠️ 该消息包含违规内容，请注意用语。']).description('命中后回复提示。'),
   watch: Schema.boolean().default(true).description('监听词库文件变更并热重载。'),
+  batchSize: Schema.number().default(400).description('合并正则的批大小。'),
+  // 新增
+  onlyGroup: Schema.boolean().default(true).description('仅在群聊生效。'),
+  muteOnHit: Schema.boolean().default(false).description('命中后禁言（仅 OneBot/QQ 有效）。'),
+  muteSeconds: Schema.number().default(0).description('禁言秒数（0 表示不禁言）。'),
+  logHits: Schema.boolean().default(true).description('命中时打印一条 info 日志。'),
 })
 
-type Matcher = {
-  regex?: RegExp
-  literal?: string
-}
-
-function stripInlineComment(line: string, useRegex: boolean): string {
-  // 移除 # 及其右侧（但在 useRegex 时，允许转义 \#
-  let result = line
-  if (useRegex) {
-    // 将未转义的 # 作为注释起点
-    let escaped = false
-    let out = ''
-    for (let i = 0; i < result.length; i++) {
-      const ch = result[i]
-      if (ch === '\\') { escaped = !escaped; out += ch; continue }
-      if (ch === '#' && !escaped) break
-      escaped = false
-      out += ch
-    }
-    result = out
-  } else {
-    const idx = result.indexOf('#')
-    if (idx >= 0) result = result.slice(0, idx)
+function normalizeLine(line: string) {
+  line = line.replace(/^\uFEFF/, '').trim()
+  if (!line) return ''
+  // 去掉未转义的行尾 # 注释
+  let out = ''
+  let escaped = false
+  for (const ch of line) {
+    if (escaped) { out += ch; escaped = false; continue }
+    if (ch === '\\') { escaped = true; out += ch; continue }
+    if (ch === '#') break
+    out += ch
   }
-  return result.trim()
+  return out.trim()
 }
 
-function compileMatchers(lines: string[], cfg: Config): { matchers: Matcher[], union: RegExp[] } {
-  const flags = cfg.ignoreCase ? 'i' : ''
-  const literals: string[] = []
-  const regexes: RegExp[] = []
-  const matchers: Matcher[] = []
+function escapeReg(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
-  for (let raw of lines) {
-    let line = stripInlineComment(raw, !!cfg.useRegex)
-    if (!line) continue
-    if (cfg.useRegex) {
-      try {
-        regexes.push(new RegExp(line, flags))
-      } catch (e) {
-        // 忽略非法正则
-      }
-    } else {
-      literals.push(line)
-    }
+function buildMatchers(lines: string[], asRegex: boolean, ignoreCase: boolean, batchSize: number): RegExp[] {
+  const flags = ignoreCase ? 'i' : ''
+  const regs: RegExp[] = []
+  for (let i = 0; i < lines.length; i += batchSize) {
+    const chunk = lines.slice(i, i + batchSize)
+    const parts = chunk
+      .filter(Boolean)
+      .map(s => asRegex ? `(${s})` : `(${escapeReg(s)})`)
+    if (!parts.length) continue
+    regs.push(new RegExp(parts.join('|'), flags))
   }
+  return regs
+}
 
-  // 将 literals 批量拼成多个正则，避免过长
-  const batchSize = 400
-  for (let i = 0; i < literals.length; i += batchSize) {
-    const batch = literals.slice(i, i + batchSize).map(s => escapeRegExp(s))
-    // 直接子串匹配，不加 \b
-    const source = batch.join('|')
-    if (source) {
-      regexes.push(new RegExp(source, flags))
-    }
+function textFromElements(session: Session): string {
+  // 可靠抽取：只拼接纯文本节点，忽略 at / emoji / image 等
+  const els = session.elements as Element[] || []
+  const texts: string[] = []
+  for (const el of els) {
+    if (typeof el === 'string') { texts.push(el); continue }
+    if (el.type === 'text') texts.push(el.attrs?.content || el.children?.join('') || '')
   }
-
-  return { matchers, union: regexes }
+  // 兜底：没有 elements 时，回退 content
+  const t = texts.join('').trim()
+  return t || (session.content || '').trim()
 }
 
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+function testHit(text: string, regs: RegExp[]): boolean {
+  if (!text) return false
+  for (const r of regs) if (r.test(text)) return true
+  return false
 }
 
-async function tryRecall(session: Session) {
+async function safeRecall(session: Session) {
   try {
-    if (session.bot && session.channelId && session.messageId) {
-      // @ts-ignore - not all adapters have the same method signature
+    if (session.bot?.deleteMessage && session.channelId && session.messageId) {
       await session.bot.deleteMessage(session.channelId, session.messageId)
     }
-  } catch {}
+  } catch (e) {
+    logger.debug('recall failed: %o', e)
+  }
 }
 
-function readLines(file: string): string[] {
+async function safeMuteIfOneBot(session: Session, seconds: number) {
+  if (!seconds || seconds <= 0) return
   try {
-    const text = fs.readFileSync(file, 'utf8')
-    // 兼容 Windows 换行
-    return text.split(/\r?\n/)
-  } catch {
-    return []
+    // 仅 OneBot/QQ 有禁言 API
+    if (session.platform?.startsWith('onebot')) {
+      const bot: any = session.bot
+      const groupId = Number(session.guildId || session.channelId)
+      const userId = Number(session.userId)
+      // v11 适配：internal.setGroupBan
+      if (bot?.internal?.setGroupBan && groupId && userId) {
+        await bot.internal.setGroupBan(groupId, userId, seconds)
+      }
+    }
+  } catch (e) {
+    logger.debug('mute failed: %o', e)
   }
 }
 
 export function apply(ctx: Context, config: Config) {
-  const dictAbs = path.isAbsolute(config.dictPath) ? config.dictPath : path.join(ctx.baseDir, config.dictPath)
+  let regs: RegExp[] = []
+  let loadedCount = 0
+  let dictAbs = ''
 
-  let compiled = compileMatchers(readLines(dictAbs), config)
-
-  const reload = () => {
-    compiled = compileMatchers(readLines(dictAbs), config)
-    ctx.logger(name).info(`ban-words: dictionary reloaded (${compiled.union.length} regex batches).`)
+  async function loadDict() {
+    try {
+      dictAbs = path.isAbsolute(config.dictPath) ? config.dictPath : path.resolve(process.cwd(), config.dictPath)
+      if (!fs.existsSync(dictAbs)) {
+        logger.warn('dict file not found: %s', dictAbs)
+        regs = []
+        loadedCount = 0
+        return
+      }
+      const raw = fs.readFileSync(dictAbs, 'utf8')
+      const lines = raw.split(/\r?\n/).map(normalizeLine).filter(Boolean)
+      loadedCount = lines.length
+      regs = buildMatchers(lines, !!config.useRegex, !!config.ignoreCase, config.batchSize!)
+      logger.info('dictionary reloaded: %d terms, %d regex batches. (%s)', loadedCount, regs.length, dictAbs)
+    } catch (e) {
+      logger.error('load dict failed: %o', e)
+      regs = []
+      loadedCount = 0
+    }
   }
 
+  // 初始化加载
+  loadDict()
+
+  // 重载命令
+  ctx.command('banwords.reload', '重载敏感词字典').action(async () => {
+    await loadDict()
+    return `已重载。当前 ${loadedCount} 条，来源：${dictAbs}`
+  })
+
+  // 自测命令
+  ctx.command('banwords.test <text:text>', '测试文本是否命中敏感词').action(async ({}, text) => {
+    if (!text) return '用法：banwords.test 需要测试的文本'
+    return testHit(text, regs) ? '✅ 命中' : '❌ 未命中'
+  })
+
+  // 监听文件变化（失败则轮询）
   if (config.watch) {
     try {
-      fs.watch(dictAbs, { persistent: false }, () => reload())
-    } catch {}
+      const watcher = fs.watch(dictAbs, { persistent: false }, async (ev) => {
+        if (ev === 'change' || ev === 'rename') {
+          logger.info('dict file changed, reloading...')
+          await loadDict()
+        }
+      })
+      ctx.on('dispose', () => watcher.close())
+    } catch {
+      let last = 0
+      const timer = setInterval(() => {
+        try {
+          const mt = fs.statSync(dictAbs).mtimeMs
+          if (mt !== last) { last = mt; logger.info('dict file changed (polling), reloading...'); loadDict() }
+        } catch {}
+      }, 5000)
+      ctx.on('dispose', () => clearInterval(timer))
+    }
   }
 
-  ctx.command('banwords.reload', '重载屏蔽词词库').action(async ({ session }) => {
-    reload()
-    return '已重载屏蔽词词库。'
-  })
-
+  // 高优先级中间件（prepend=true）
   ctx.middleware(async (session, next) => {
-    const text = session.elements?.join('') || session.content || ''
-    if (!text) return next()
+    if (config.onlyGroup && !session.guildId) return next()
 
-    // 匹配
-    let hit = false
-    for (const re of compiled.union) {
-      if (re.test(text)) { hit = true; break }
-    }
+    const text = textFromElements(session)
+    if (!text || regs.length === 0) return next()
+
+    const hit = testHit(text, regs)
+
+    // 命中/未命中都打 info（若你嫌多，可把这里改成 debug）
+    if (config.logHits) logger.info('check: text="%s" -> %s', text, hit ? 'HIT' : 'PASS')
+
     if (!hit) return next()
 
-    if (config.recallOnHit) await tryRecall(session)
+    if (config.recallOnHit) await safeRecall(session)
 
-    // 回复提示
-    if (config.replyHints && config.replyHints.length) {
-      const msg = Random.pick(config.replyHints)
-      if (msg) await session.send(msg)
+    if (config.muteOnHit && (config.muteSeconds || 0) > 0) {
+      await safeMuteIfOneBot(session, Math.max(0, config.muteSeconds! | 0))
     }
 
-    if (config.blockOnHit) return // 阻断
+    if (config.replyHints?.length) {
+      const hint = config.replyHints[Math.floor(Math.random() * config.replyHints.length)]
+      await session.send(hint)
+    }
+
+    if (config.blockOnHit) return
     return next()
-  })
+  }, true)
 }
