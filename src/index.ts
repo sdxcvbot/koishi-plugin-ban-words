@@ -1,221 +1,164 @@
-import { Context, Schema, Logger, Session, Element, h } from 'koishi'
+import { Context, Schema, Logger, Session, h } from 'koishi'
 import fs from 'fs'
 import path from 'path'
 
 const logger = new Logger('ban-words')
 
 export interface Config {
-  dictPath: string
-  useRegex?: boolean
-  ignoreCase?: boolean
-  recallOnHit?: boolean
-  blockOnHit?: boolean
-  replyHints?: string[]
-  watch?: boolean
-  batchSize?: number
-  onlyGroup?: boolean
-  muteOnHit?: boolean
-  muteSeconds?: number
-  logHits?: boolean
+  dictFile: string
+  replyHints: string[]
+  whitelistQQ: string[]
+  maxLogMatches: number
 }
 
 export const name = 'ban-words'
 
 export const Config: Schema<Config> = Schema.object({
-  dictPath: Schema.string().required().description('词库 TXT 路径（可相对 Koishi 工作目录）。'),
-  useRegex: Schema.boolean().default(false).description('将每一行视为正则式。'),
-  ignoreCase: Schema.boolean().default(true).description('忽略大小写匹配。'),
-  recallOnHit: Schema.boolean().default(false).description('命中后尝试撤回原消息。'),
-  blockOnHit: Schema.boolean().default(false).description('命中后阻断后续中间件。'),
+  dictFile: Schema.string()
+    .default('/koishi/ceshi.txt')
+    .description('敏感词词典文件路径。**必须 UTF-8**，每行一个；正则用 `/.../flags`。'),
   replyHints: Schema.array(Schema.string())
-    .default(['{at} 你的发言包含违规词，已撤回并禁言 {minutes} 分钟。（ID: {id}，昵称：{name}）'])
-    .description('命中后回复提示，支持 {at} {name} {id} {minutes} 占位符。'),
-  watch: Schema.boolean().default(true).description('监听词库文件变更并热重载。'),
-  batchSize: Schema.number().default(400).description('合并正则的批大小。'),
-  onlyGroup: Schema.boolean().default(true).description('仅在群聊生效。'),
-  muteOnHit: Schema.boolean().default(false).description('命中后禁言（仅 OneBot/QQ 有效）。'),
-  muteSeconds: Schema.number().default(0).description('禁言秒数（0 表示不禁言）。'),
-  logHits: Schema.boolean().default(true).description('命中时打印一条 info 日志。'),
+    .role('table')
+    .description('命中后回复提示，支持占位符：{at} {name} {id} {minutes}')
+    .default(['{at} 你的发言包含违禁词，已被撤回。']),
+  whitelistQQ: Schema.array(Schema.string())
+    .description('白名单 QQ 号（字符串）。在此列表内将跳过敏感词检查。')
+    .default([]),
+  maxLogMatches: Schema.number()
+    .description('日志中最多展示的命中词条数量。')
+    .default(50),
 })
 
-/** 处理行：去 BOM/空白/行尾注释（未转义 #） */
-function normalizeLine(line: string) {
-  line = line.replace(/^\uFEFF/, '').trim()
-  if (!line) return ''
-  let out = ''
-  let escaped = false
-  for (const ch of line) {
-    if (escaped) { out += ch; escaped = false; continue }
-    if (ch === '\\') { escaped = true; out += ch; continue }
-    if (ch === '#') break
-    out += ch
+let plainTerms: string[] = []
+let regexTerms: RegExp[] = []
+let regexBatches: RegExp[] = []
+
+function escapeRegExp(s: string) {
+  return s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
+}
+
+function loadDict(dictFile: string) {
+  const t0 = Date.now()
+  const content = fs.readFileSync(dictFile, 'utf8')
+  const lines = content.split(/\r?\n/)
+
+  const _plain: string[] = []
+  const _regex: RegExp[] = []
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    if (line.startsWith('/') && line.lastIndexOf('/') > 0) {
+      const last = line.lastIndexOf('/')
+      const body = line.slice(1, last)
+      const flags = line.slice(last + 1) || 'i'
+      try {
+        _regex.push(new RegExp(body, flags))
+      } catch (e) {
+        logger.warn('invalid regex in dict: %s  -> %s', line, e)
+      }
+    } else {
+      _plain.push(line)
+    }
   }
-  return out.trim()
-}
 
-function escapeReg(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function buildMatchers(lines: string[], asRegex: boolean, ignoreCase: boolean, batchSize: number): RegExp[] {
-  const flags = ignoreCase ? 'i' : ''
-  const regs: RegExp[] = []
-  for (let i = 0; i < lines.length; i += batchSize) {
-    const chunk = lines.slice(i, i + batchSize)
-    const parts = chunk.filter(Boolean).map(s => asRegex ? `(${s})` : `(${escapeReg(s)})`)
-    if (parts.length) regs.push(new RegExp(parts.join('|'), flags))
+  const batchSize = 400
+  const batches: RegExp[] = []
+  for (let i = 0; i < _plain.length; i += batchSize) {
+    const slice = _plain.slice(i, i + batchSize)
+    if (slice.length === 0) continue
+    const pattern = slice.map(escapeRegExp).join('|')
+    batches.push(new RegExp(`(${pattern})`, 'i'))
   }
-  return regs
+
+  plainTerms = _plain
+  regexTerms = _regex
+  regexBatches = batches
+
+  logger.info(
+    'ban-words dictionary reloaded: %d terms, %d regex batches. (%s) in %dms',
+    _plain.length, batches.length, dictFile, Date.now() - t0,
+  )
 }
 
-/** 更稳地从消息里抽取纯文本（忽略 @、表情、图片等） */
-function textFromElements(session: Session): string {
-  const els = (session.elements as Element[]) || []
-  const texts: string[] = []
-  for (const el of els) {
-    if (typeof el === 'string') { texts.push(el); continue }
-    if (el.type === 'text') texts.push(el.attrs?.content || (el.children?.join('') ?? ''))
+function collectMatches(text: string): string[] {
+  const matched: string[] = []
+  for (const w of plainTerms) {
+    if (w && text.includes(w)) matched.push(w)
   }
-  const t = texts.join('').trim()
-  return t || (session.content || '').trim()
+  for (const r of regexTerms) {
+    if (r.test(text)) matched.push(`/${r.source}/${r.flags}`)
+  }
+  return matched
 }
 
-function testHit(text: string, regs: RegExp[]): boolean {
-  if (!text) return false
-  for (const r of regs) if (r.test(text)) return true
+function isHit(text: string): boolean {
+  for (const re of regexBatches) if (re.test(text)) return true
+  for (const r of regexTerms) if (r.test(text)) return true
   return false
 }
 
-async function safeRecall(session: Session) {
-  try {
-    if (session.bot?.deleteMessage && session.channelId && session.messageId) {
-      await session.bot.deleteMessage(session.channelId, session.messageId)
-    }
-  } catch (e) {
-    logger.debug('recall failed: %o', e)
-  }
-}
+function renderReply(tpl: string, session: Session, minutes = 20) {
+  const name = session?.username || session?.author?.name || ''
+  const id = session?.userId || ''
+  // 通用 @ 片段（Koishi 的 segment）：大多数平台可正确渲染；没有 id 时退回纯文本
+  const atSeg = id ? String(h.at(id)) : (name ? `@${name}` : '')
 
-/** 仅 OneBot/QQ 有效：需要机器人有管理员权限 */
-async function safeMuteIfOneBot(session: Session, seconds: number) {
-  if (!seconds || seconds <= 0) return
-  try {
-    if (session.platform?.startsWith('onebot')) {
-      const bot: any = session.bot
-      const groupId = Number(session.guildId) // QQ 群号
-      const userId = Number(session.userId)
-      // OneBot v11 常见接口
-      if (bot?.internal?.setGroupBan && groupId && userId) {
-        await bot.internal.setGroupBan(groupId, userId, seconds)
-      }
-    }
-  } catch (e) {
-    logger.debug('mute failed: %o', e)
-  }
+  // 用正则全局替换，避免 String.replaceAll 的 ES2021 依赖
+  return tpl
+    .replace(/\{at\}/g, atSeg)
+    .replace(/\{name\}/g, name)
+    .replace(/\{id\}/g, id)
+    .replace(/\{minutes\}/g, String(minutes))
 }
 
 export function apply(ctx: Context, config: Config) {
-  let regs: RegExp[] = []
-  let loadedCount = 0
-  let dictAbs = ''
-
-  function readDictUtf8(file: string): string {
-    // 强制按 UTF-8 读取（GBK/ANSI 会导致中文丢失，从而匹配不到）
-    return fs.readFileSync(file, 'utf8')
+  if (fs.existsSync(config.dictFile)) {
+    loadDict(config.dictFile)
+  } else {
+    logger.warn('dict file not found: %s', config.dictFile)
   }
 
-  async function loadDict() {
-    try {
-      dictAbs = path.isAbsolute(config.dictPath) ? config.dictPath : path.resolve(process.cwd(), config.dictPath)
-      if (!fs.existsSync(dictAbs)) {
-        logger.warn('dict file not found: %s', dictAbs)
-        regs = []
-        loadedCount = 0
-        return
+  try {
+    fs.watchFile(config.dictFile, { interval: 800 }, () => {
+      logger.info('ban-words dict file changed, reloading...')
+      try {
+        loadDict(config.dictFile)
+      } catch (e) {
+        logger.warn('reload failed: %s', e)
       }
-      const raw = readDictUtf8(dictAbs)
-      const lines = raw.split(/\r?\n/).map(normalizeLine).filter(Boolean)
-      loadedCount = lines.length
-      regs = buildMatchers(lines, !!config.useRegex, !!config.ignoreCase, config.batchSize!)
-      logger.info('dictionary reloaded: %d terms, %d regex batches. (%s)', loadedCount, regs.length, dictAbs)
-    } catch (e) {
-      logger.error('load dict failed: %o', e)
-      regs = []
-      loadedCount = 0
-    }
-  }
+    })
+  } catch {}
 
-  // 初始化加载
-  loadDict()
-
-  // 命令：手动重载
-  ctx.command('banwords.reload', '重载敏感词字典').action(async () => {
-    await loadDict()
-    return `已重载。当前 ${loadedCount} 条，来源：${dictAbs}`
-  })
-
-  // 命令：自测匹配
-  ctx.command('banwords.test <text:text>', '测试文本是否命中敏感词').action(async ({}, text) => {
-    if (!text) return '用法：banwords.test 需要测试的文本'
-    return testHit(text, regs) ? '✅ 命中' : '❌ 未命中'
-  })
-
-  // 监听文件变化（失败则降级为轮询）
-  if (config.watch) {
-    try {
-      const watcher = fs.watch(dictAbs, { persistent: false }, async (ev) => {
-        if (ev === 'change' || ev === 'rename') {
-          logger.info('dict file changed, reloading...')
-          await loadDict()
-        }
-      })
-      ctx.on('dispose', () => watcher.close())
-    } catch {
-      let last = 0
-      const timer = setInterval(() => {
-        try {
-          const mt = fs.statSync(dictAbs).mtimeMs
-          if (mt !== last) { last = mt; logger.info('dict file changed (polling), reloading...'); loadDict() }
-        } catch {}
-      }, 5000)
-      ctx.on('dispose', () => clearInterval(timer))
-    }
-  }
-
-  // 高优先级中间件（prepend=true）
   ctx.middleware(async (session, next) => {
-    if (config.onlyGroup && !session.guildId) return next()
+    const text = (session.elements?.length
+      ? session.elements.map(e => (e.type === 'text' ? (e.attrs?.content ?? '') : '')).join('')
+      : (session.content || '')
+    ).trim()
 
-    const text = textFromElements(session)
-    if (!text || regs.length === 0) return next()
+    if (!text) return next()
 
-    const hit = testHit(text, regs)
-    if (config.logHits) logger.info('check: text="%s" -> %s', text, hit ? 'HIT' : 'PASS')
-    if (!hit) return next()
-
-    // 命中处理链
-    if (config.recallOnHit) await safeRecall(session)
-    if (config.muteOnHit && (config.muteSeconds || 0) > 0) {
-      await safeMuteIfOneBot(session, Math.max(0, (config.muteSeconds || 0) | 0))
+    const uid = session.userId || ''
+    if (uid && config.whitelistQQ.includes(uid)) {
+      logger.debug('whitelist pass: user=%s text=%j', uid, text)
+      return next()
     }
 
-    // 发送提示（支持占位符）
+    if (!isHit(text)) return next()
+
+    const matched = collectMatches(text)
+    const shown = matched.slice(0, Math.max(1, config.maxLogMatches || 50))
+    const more = matched.length > shown.length ? ` (+${matched.length - shown.length} more)` : ''
+    logger.info('ban-words check: text=%j -> HIT(%d): [%s]%s',
+      text, matched.length, shown.join(', '), more)
+
     if (config.replyHints?.length) {
-      const raw = config.replyHints[Math.floor(Math.random() * config.replyHints.length)]
-      const name = session.username || session.author?.nickname || session.author?.name || session.userId
-      const at = session.platform?.startsWith('onebot')
-        ? h('at', { id: session.userId }) // QQ/OneBot 真 @
-        : `@${name}`
-      const minutes = Math.max(0, Math.floor((config.muteSeconds || 0) / 60))
-      const hint = raw
-        .replace(/\{at\}/g, String(at))
-        .replace(/\{name\}/g, String(name))
-        .replace(/\{id\}/g, String(session.userId))
-        .replace(/\{minutes\}/g, String(minutes))
-      await session.send(hint)
+      try {
+        await session.send(renderReply(config.replyHints[0], session, 20))
+      } catch (e) {
+        logger.warn('send hint failed: %s', e)
+      }
     }
-
-    if (config.blockOnHit) return
-    return next()
-  }, true)
+    return
+  })
 }

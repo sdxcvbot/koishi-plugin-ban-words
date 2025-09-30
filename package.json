@@ -32,7 +32,7 @@
   },
   "devDependencies": {
     "tsup": "^8.0.1",
-    "typescript": "^5.5.4"
+    "typescript": "^5.9.2"
   },
   "scripts": {
     "build": "tsup src/index.ts --dts --format cjs --target node16 --external koishi --out-dir lib",
